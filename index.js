@@ -7,10 +7,16 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 const morgan = require("morgan");
 const port = process.env.PORT || 8000;
+const stripe = require("stripe")(process.env.PAYMENT_SECRET_KEY);
+const nodemailer = require("nodemailer");
 
 // middleware
 const corsOptions = {
-  origin: ["http://localhost:5173", "http://localhost:5174"],
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://stay-finder-client.vercel.app",
+  ],
   credentials: true,
   optionSuccessStatus: 200,
 };
@@ -34,6 +40,45 @@ const verifyToken = async (req, res, next) => {
   });
 };
 
+// Send email
+const sendEmail = (emailAddress, emailData) => {
+  //Create a transporter
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false,
+    auth: {
+      user: process.env.MAIL,
+      pass: process.env.PASS,
+    },
+  });
+
+  //verify connection
+  transporter.verify((error, success) => {
+    if (error) {
+      console.log(error);
+    } else {
+      console.log("Server is ready to take our emails", success);
+    }
+  });
+
+  const mailBody = {
+    from: process.env.MAIL,
+    to: emailAddress,
+    subject: emailData?.subject,
+    html: `<p>${emailData?.message}</p>`,
+  };
+
+  transporter.sendMail(mailBody, (error, info) => {
+    if (error) {
+      console.log(error);
+    } else {
+      console.log("Email sent: " + info.response);
+    }
+  });
+};
+
 const client = new MongoClient(process.env.DB_URI, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -41,16 +86,41 @@ const client = new MongoClient(process.env.DB_URI, {
     deprecationErrors: true,
   },
 });
+
 async function run() {
   try {
     const usersCollection = client.db("stayFinderDb").collection("users");
     const roomsCollection = client.db("stayFinderDb").collection("rooms");
+    const bookingsCollection = client.db("stayFinderDb").collection("bookings");
+
+    // Role verification middlewares
+    // For admins
+    const verifyAdmin = async (req, res, next) => {
+      const user = req.user;
+      console.log("user from verify admin", user);
+      const query = { email: user?.email };
+      const result = await usersCollection.findOne(query);
+      if (!result || result?.role !== "admin")
+        return res.status(401).send({ message: "unauthorized access" });
+      next();
+    };
+
+    // For hosts
+    const verifyHost = async (req, res, next) => {
+      const user = req.user;
+      const query = { email: user?.email };
+      const result = await usersCollection.findOne(query);
+      console.log("host result", result);
+      if (!result || result?.role !== "host")
+        return res.status(401).send({ message: "unauthorized access" });
+      next();
+    };
     // auth related api
     app.post("/jwt", async (req, res) => {
       const user = req.body;
       console.log("I need a new jwt", user);
       const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-        expiresIn: "365d",
+        expiresIn: "3600000000000",
       });
       res
         .cookie("token", token, {
@@ -85,7 +155,20 @@ async function run() {
       const options = { upsert: true };
       const isExist = await usersCollection.findOne(query);
       console.log("User found?----->", isExist);
-      if (isExist) return res.send(isExist);
+      if (isExist) {
+        if (user?.status === "Requested") {
+          const result = await usersCollection.updateOne(
+            query,
+            {
+              $set: user,
+            },
+            options
+          );
+          return res.send(result);
+        } else {
+          return res.send(isExist);
+        }
+      }
       const result = await usersCollection.updateOne(
         query,
         {
@@ -110,7 +193,7 @@ async function run() {
     });
 
     //get rooms for host
-    app.get("/rooms/:email", async (req, res) => {
+    app.get("/rooms/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
       const result = await roomsCollection
         .find({ "host.email": email })
@@ -130,6 +213,214 @@ async function run() {
       const room = req.body;
       const result = await roomsCollection.insertOne(room);
       res.send(result);
+    });
+
+    // Generate client secret for stripe payment
+    app.post("/create-payment-intent", verifyToken, async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      if (!price || amount < 1) return;
+      const { client_secret } = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({ clientSecret: client_secret });
+    });
+
+    // Save booking info in booking collection
+    app.post("/bookings", verifyToken, async (req, res) => {
+      const booking = req.body;
+      const result = await bookingsCollection.insertOne(booking);
+      // Send Email.....
+      if (result.insertedId) {
+        // To guest
+        sendEmail(booking.guest.email, {
+          subject: "Booking Successful!",
+          message: `Room Ready,  Transaction Id: ${booking.transactionId}`,
+        });
+
+        // To Host
+        sendEmail(booking.host, {
+          subject: "Your room got booked!",
+          message: `Room booked by ${booking.guest.name} `,
+        });
+      }
+      res.send(result);
+    });
+
+    // Update room booking status
+    app.patch("/rooms/status/:id", async (req, res) => {
+      const id = req.params.id;
+      const status = req.body.status;
+      const query = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          booked: status,
+        },
+      };
+      const result = await roomsCollection.updateOne(query, updateDoc);
+      res.send(result);
+    });
+
+    // Get all bookings for guest
+    app.get("/bookings", verifyToken, async (req, res) => {
+      const email = req.query.email;
+      if (!email) return res.send([]);
+      const query = { "guest.email": email };
+      const result = await bookingsCollection.find(query).toArray();
+      res.send(result);
+    });
+    // Get all bookings for host
+    app.get("/bookings/host", verifyToken, async (req, res) => {
+      const email = req.query.email;
+      if (!email) return res.send([]);
+      const query = { host: email };
+      const result = await bookingsCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    // Get all users
+    app.get("/users", verifyToken, async (req, res) => {
+      const result = await usersCollection.find().toArray();
+      res.send(result);
+    });
+
+    // Update user role
+    app.put(
+      "/users/update/:email",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const email = req.params.email;
+        const user = req.body;
+        const query = { email: email };
+        const options = { upsert: true };
+        const updateDoc = {
+          $set: {
+            ...user,
+            timestamp: Date.now(),
+          },
+        };
+        const result = await usersCollection.updateOne(
+          query,
+          updateDoc,
+          options
+        );
+        res.send(result);
+      }
+    );
+
+    // Admin Stat Data
+    app.get("/admin-stat", verifyToken, verifyAdmin, async (req, res) => {
+      const bookingsDetails = await bookingsCollection
+        .find({}, { projection: { date: 1, price: 1 } })
+        .toArray();
+      const userCount = await usersCollection.countDocuments();
+      const roomCount = await roomsCollection.countDocuments();
+      const totalSale = bookingsDetails.reduce(
+        (sum, data) => sum + data.price,
+        0
+      );
+
+      const chartData = bookingsDetails.map((data) => {
+        const day = new Date(data.date).getDate();
+        const month = new Date(data.date).getMonth() + 1;
+        return [day + "/" + month, data.price];
+      });
+      chartData.unshift(["Day", "Sale"]);
+      res.send({
+        totalSale,
+        bookingCount: bookingsDetails.length,
+        userCount,
+        roomCount,
+        chartData,
+      });
+    });
+    // Host Statistics
+    app.get("/host-stat", verifyToken, verifyHost, async (req, res) => {
+      const { email } = req.user;
+
+      const bookingsDetails = await bookingsCollection
+        .find(
+          { host: email },
+          {
+            projection: {
+              date: 1,
+              price: 1,
+            },
+          }
+        )
+        .toArray();
+      const roomCount = await roomsCollection.countDocuments({
+        "host.email": email,
+      });
+      const totalSale = bookingsDetails.reduce(
+        (acc, data) => acc + data.price,
+        0
+      );
+      const chartData = bookingsDetails.map((data) => {
+        const day = new Date(data.date).getDate();
+        const month = new Date(data.date).getMonth() + 1;
+        return [day + "/" + month, data.price];
+      });
+      chartData.splice(0, 0, ["Day", "Sale"]);
+      const { timestamp } = await usersCollection.findOne(
+        { email },
+        {
+          projection: {
+            timestamp: 1,
+          },
+        }
+      );
+      res.send({
+        totalSale,
+        bookingCount: bookingsDetails.length,
+        roomCount,
+        chartData,
+        hostSince: timestamp,
+      });
+    });
+    // Guest Statistics
+    app.get("/guest-stat", verifyToken, async (req, res) => {
+      const { email } = req.user;
+
+      const bookingsDetails = await bookingsCollection
+        .find(
+          { "guest.email": email },
+          {
+            projection: {
+              date: 1,
+              price: 1,
+            },
+          }
+        )
+        .toArray();
+
+      const chartData = bookingsDetails.map((data) => {
+        const day = new Date(data.date).getDate();
+        const month = new Date(data.date).getMonth() + 1;
+        return [day + "/" + month, data.price];
+      });
+      chartData.splice(0, 0, ["Day", "Reservation"]);
+      const { timestamp } = await usersCollection.findOne(
+        { email },
+        {
+          projection: {
+            timestamp: 1,
+          },
+        }
+      );
+      const totalSpent = bookingsDetails.reduce(
+        (acc, data) => acc + data.price,
+        0
+      );
+      res.send({
+        bookingCount: bookingsDetails.length,
+        chartData,
+        guestSince: timestamp,
+        totalSpent,
+      });
     });
 
     // Send a ping to confirm a successful connection
